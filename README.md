@@ -1,4 +1,4 @@
-# Etairos.ai Log Agent
+# Splunk multi Log Agent
 
 **A Splunk app that tees your Universal Forwarder output to any destination.**
 
