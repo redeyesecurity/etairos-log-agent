@@ -28,6 +28,13 @@ import sys
 import time
 from datetime import datetime, timezone
 
+# Lakehouse plugin (optional — only active when output.lakehouse.enabled: true)
+try:
+    from lakehouse_writer import LakehouseWriter, LakehouseConfig
+    _LAKEHOUSE_AVAILABLE = True
+except ImportError:
+    _LAKEHOUSE_AVAILABLE = False
+
 # yaml is stdlib in Python 3.11+; fall back to a tiny inline parser for older versions
 try:
     import yaml
@@ -153,6 +160,9 @@ class Config:
         lg = deep_get(raw, "logging") or {}
         self.log_level    = lg.get("level",        "INFO")
         self.log_every_n  = lg.get("log_every_n",  500)
+
+        # Lakehouse
+        self.lakehouse_raw = deep_get(raw, "output", "lakehouse") or {}
 
     def validate(self):
         if self.tls and (not self.cert or not self.key):
@@ -332,7 +342,7 @@ class Forwarder:
 # Client handler
 # ---------------------------------------------------------------------------
 
-def handle_client(conn, addr, cfg: Config, lock, forwarder):
+def handle_client(conn, addr, cfg: Config, lock, forwarder, lakehouse=None):
     log.info(f"UF connected: {addr[0]}:{addr[1]}")
     events_written = 0
     try:
@@ -368,11 +378,16 @@ def handle_client(conn, addr, cfg: Config, lock, forwarder):
                 forwarder.send(len_bytes, frame_data)
 
             fields = decode_kv_block(frame_data)
-            line   = format_event(fields, addr[0])
 
+            # Local flat file output
+            line = format_event(fields, addr[0])
             with lock:
                 with open(cfg.output, "a", encoding="utf-8") as f:
                     f.write(line)
+
+            # Lakehouse output (OCSF)
+            if lakehouse:
+                lakehouse.write(fields)
 
             events_written += 1
             if events_written % cfg.log_every_n == 0:
@@ -427,6 +442,15 @@ def run_server(cfg: Config):
     os.makedirs(os.path.dirname(os.path.abspath(cfg.output)), exist_ok=True)
     lock = threading.Lock()
 
+    # Lakehouse writer
+    lakehouse = None
+    if _LAKEHOUSE_AVAILABLE and cfg.lakehouse_raw.get("enabled"):
+        lh_cfg   = LakehouseConfig(cfg.lakehouse_raw)
+        lh_cfg.validate()
+        lakehouse = LakehouseWriter(lh_cfg, shutdown_event)
+    elif cfg.lakehouse_raw.get("enabled"):
+        log.warning("Lakehouse enabled in config but lakehouse_writer.py not found — skipping")
+
     log.setLevel(cfg.log_level)
     log.info(f"Listening on {cfg.host}:{cfg.port} — writing to {cfg.output}")
 
@@ -457,7 +481,7 @@ def run_server(cfg: Config):
 
         t = threading.Thread(
             target=handle_client,
-            args=(conn, addr, cfg, lock, forwarder),
+            args=(conn, addr, cfg, lock, forwarder, lakehouse),
             daemon=True
         )
         t.start()
