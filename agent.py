@@ -7,24 +7,12 @@ forwards the raw bytes upstream to the real indexer unchanged.
 
 Architecture:
   [Splunk UF] --> [etairos-log-agent :9997] --> [Real Splunk Indexer :9997]
-                                             \-> [output file / lakehouse]
+                                             --> [output file / lakehouse]
 
 Usage:
-  Plain (no TLS):
-    python3 agent.py --port 9997 --output events.log --forward splunk-indexer.corp:9997
-
-  TLS inbound + plain forward:
-    python3 agent.py --port 9997 --output events.log --forward splunk-indexer.corp:9997 \
-      --tls --cert server.crt --key server.key
-
-  TLS both directions:
-    python3 agent.py --port 9997 --output events.log --forward splunk-indexer.corp:9997 \
-      --tls --cert server.crt --key server.key \
-      --forward-tls --forward-cert client.crt --forward-key client.key [--forward-ca ca.crt]
-
-outputs.conf on UF (change only the server address):
-  [tcpout:etairos-tee]
-  server = <this-host-ip>:9997
+  python3 agent.py --config config.yaml
+  python3 agent.py --config config.yaml --port 9998   # CLI overrides config
+  python3 agent.py --help
 """
 
 import socket
@@ -37,7 +25,50 @@ import os
 import queue
 import signal
 import sys
+import time
 from datetime import datetime, timezone
+
+# yaml is stdlib in Python 3.11+; fall back to a tiny inline parser for older versions
+try:
+    import yaml
+    def load_yaml(path):
+        with open(path) as f:
+            return yaml.safe_load(f)
+except ImportError:
+    import re, json
+    def load_yaml(path):
+        # Minimal YAML -> dict for simple flat/nested key: value files
+        # Handles strings, bools, ints; strips comments
+        def parse_val(v):
+            v = v.strip().strip('"').strip("'")
+            if v.lower() == "true": return True
+            if v.lower() == "false": return False
+            try: return int(v)
+            except ValueError: pass
+            return v
+        result = {}
+        stack = [(result, -1)]
+        with open(path) as f:
+            for line in f:
+                line = line.rstrip()
+                if not line or line.lstrip().startswith("#"): continue
+                indent = len(line) - len(line.lstrip())
+                line = line.lstrip()
+                if ":" not in line: continue
+                key, _, val = line.partition(":")
+                key = key.strip()
+                val = val.strip()
+                while len(stack) > 1 and stack[-1][1] >= indent:
+                    stack.pop()
+                parent = stack[-1][0]
+                if not val or val.startswith("#"):
+                    parent[key] = {}
+                    stack.append((parent[key], indent))
+                else:
+                    val = val.split("#")[0].strip()
+                    parent[key] = parse_val(val)
+        return result
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,8 +79,87 @@ log = logging.getLogger("etairos-log-agent")
 
 S2S_SIGNATURE = b"--CH"
 S2S_SIGNATURE_LEN = 128
-
 shutdown_event = threading.Event()
+
+
+# ---------------------------------------------------------------------------
+# Config loader
+# ---------------------------------------------------------------------------
+
+def deep_get(d, *keys, default=None):
+    for k in keys:
+        if not isinstance(d, dict): return default
+        d = d.get(k, default)
+    return d
+
+
+class Config:
+    def __init__(self, path=None, cli_args=None):
+        raw = {}
+        if path:
+            raw = load_yaml(path)
+            log.info(f"Loaded config from {path}")
+
+        a = cli_args or {}
+
+        # Inbound listener
+        self.host       = a.get("host")    or deep_get(raw, "listener", "host",    default="0.0.0.0")
+        self.port       = a.get("port")    or deep_get(raw, "listener", "port",    default=9997)
+
+        # Inbound TLS
+        itls = deep_get(raw, "listener", "tls") or {}
+        self.tls            = a.get("tls")          or itls.get("enabled",      False)
+        self.cert           = a.get("cert")          or itls.get("cert",         "")
+        self.key            = a.get("key")           or itls.get("key",          "")
+        self.ca             = a.get("ca")            or itls.get("ca",           "")
+        self.verify_client  = itls.get("verify_client", False)
+        self.ignore_ssl_in  = a.get("ignore_ssl")   or itls.get("ignore_ssl",   False)
+
+        # Output
+        out = deep_get(raw, "output") or {}
+        self.output = a.get("output") or out.get("file", "extracted.log")
+
+        # Forward
+        fwd  = deep_get(raw, "forward")       or {}
+        ftls = deep_get(raw, "forward", "tls") or {}
+        fov  = deep_get(raw, "forward", "failover") or {}
+
+        self.forward_enabled   = fwd.get("enabled", True) if not a.get("forward") else True
+        _fwd_raw               = a.get("forward") or ""
+        if _fwd_raw and ":" in _fwd_raw:
+            fh, fp = _fwd_raw.rsplit(":", 1)
+            self.forward_host  = fh
+            self.forward_port  = int(fp)
+        else:
+            self.forward_host  = fwd.get("host", "")
+            self.forward_port  = fwd.get("port", 9997)
+
+        # Forward TLS
+        self.forward_tls         = a.get("forward_tls")   or ftls.get("enabled",    False)
+        self.forward_cert        = a.get("forward_cert")   or ftls.get("cert",       "")
+        self.forward_key         = a.get("forward_key")    or ftls.get("key",        "")
+        self.forward_ca          = a.get("forward_ca")     or ftls.get("ca",         "")
+        self.forward_ignore_ssl  = a.get("ignore_ssl")     or ftls.get("ignore_ssl", False)
+
+        # Failover
+        self.fail_open         = (fov.get("mode", "fail-open") == "fail-open") \
+                                  if not a.get("fail_closed") else False
+        self.queue_max         = fov.get("queue_max",      100_000)
+        self.reconnect_delay   = fov.get("reconnect_delay", 2)
+        self.retry_forever     = fov.get("retry_forever",   True)
+        self.max_retries       = fov.get("max_retries",     0)
+
+        # Logging
+        lg = deep_get(raw, "logging") or {}
+        self.log_level    = lg.get("level",        "INFO")
+        self.log_every_n  = lg.get("log_every_n",  500)
+
+    def validate(self):
+        if self.tls and (not self.cert or not self.key):
+            raise ValueError("listener.tls.enabled requires cert and key paths")
+        if self.forward_enabled and self.forward_host and self.forward_tls:
+            if not self.forward_ignore_ssl and (not self.forward_cert or not self.forward_key):
+                log.warning("forward.tls.enabled without cert/key — server auth only (no mutual TLS)")
 
 
 # ---------------------------------------------------------------------------
@@ -76,23 +186,20 @@ def send_all(sock, data):
 
 
 # ---------------------------------------------------------------------------
-# S2S decode (for local output only — forward uses raw bytes)
+# S2S decode
 # ---------------------------------------------------------------------------
 
 def decode_kv_block(data):
     fields = {}
     offset = 0
     while offset < len(data):
-        if offset + 4 > len(data):
-            break
+        if offset + 4 > len(data): break
         key_len = struct.unpack(">I", data[offset:offset+4])[0]
         offset += 4
-        if key_len == 0 or offset + key_len > len(data):
-            break
+        if key_len == 0 or offset + key_len > len(data): break
         key = data[offset:offset+key_len].decode("utf-8", errors="replace")
         offset += key_len
-        if offset + 4 > len(data):
-            break
+        if offset + 4 > len(data): break
         val_len = struct.unpack(">I", data[offset:offset+4])[0]
         offset += 4
         val = data[offset:offset+val_len].decode("utf-8", errors="replace")
@@ -102,75 +209,74 @@ def decode_kv_block(data):
 
 
 def format_event(fields, fallback_ip):
-    raw = fields.get("_raw", "")
-    if not raw:
-        raw = " | ".join(f"{k}={v}" for k, v in fields.items() if not k.startswith("_"))
-    source = fields.get("source", "unknown")
-    host = fields.get("host", fallback_ip)
+    raw = fields.get("_raw", "") or \
+          " | ".join(f"{k}={v}" for k, v in fields.items() if not k.startswith("_"))
+    source     = fields.get("source",     "unknown")
+    host       = fields.get("host",       fallback_ip)
     sourcetype = fields.get("sourcetype", "unknown")
-    ts = fields.get("_time", "") or datetime.now(timezone.utc).isoformat()
+    ts         = fields.get("_time", "") or datetime.now(timezone.utc).isoformat()
     return f"[{ts}] host={host} source={source} sourcetype={sourcetype} | {raw}\n"
 
 
 # ---------------------------------------------------------------------------
-# Forward connection manager (reconnects on failure)
+# Forwarder
 # ---------------------------------------------------------------------------
 
 class Forwarder:
-    """
-    Maintains a persistent connection to the real indexer.
-    Queues raw frame bytes; background thread drains the queue.
-    fail_open=True: drop frames if indexer is unreachable (default).
-    fail_open=False: buffer indefinitely (risk: memory growth if indexer is down long).
-    """
+    def __init__(self, cfg: Config):
+        self.host            = cfg.forward_host
+        self.port            = cfg.forward_port
+        self.tls             = cfg.forward_tls
+        self.cert            = cfg.forward_cert
+        self.key             = cfg.forward_key
+        self.ca              = cfg.forward_ca
+        self.ignore_ssl      = cfg.forward_ignore_ssl
+        self.fail_open       = cfg.fail_open
+        self.reconnect_delay = cfg.reconnect_delay
+        self.retry_forever   = cfg.retry_forever
+        self.max_retries     = cfg.max_retries
+        self._q              = queue.Queue(maxsize=cfg.queue_max)
+        self._sock           = None
+        self._lock           = threading.Lock()
+        self._attempt        = 0
+        t = threading.Thread(target=self._drain, daemon=True, name="forwarder")
+        t.start()
 
-    def __init__(self, host, port, tls=False, cert=None, key=None, ca=None,
-                 fail_open=True, queue_max=100_000):
-        self.host = host
-        self.port = port
-        self.tls = tls
-        self.cert = cert
-        self.key = key
-        self.ca = ca
-        self.fail_open = fail_open
-        self._q = queue.Queue(maxsize=queue_max)
-        self._sock = None
-        self._lock = threading.Lock()
-        self._thread = threading.Thread(target=self._drain, daemon=True, name="forwarder")
-        self._thread.start()
-
-    def send(self, raw_header, frame_len_bytes, frame_data):
-        """Enqueue a raw frame (header + length prefix + body) for forwarding."""
-        payload = raw_header + frame_len_bytes + frame_data
+    def send(self, len_bytes, frame_data):
+        payload = len_bytes + frame_data
         try:
             self._q.put_nowait(payload)
         except queue.Full:
             if self.fail_open:
-                log.warning("Forward queue full — dropping frame (fail_open=True)")
+                log.warning("Forward queue full — dropping frame (fail-open)")
             else:
-                self._q.put(payload)  # block
+                self._q.put(payload)
 
-    def send_handshake(self, handshake_bytes):
-        """Send the raw S2S handshake to the indexer immediately (called once per UF conn)."""
+    def send_handshake(self, data):
         with self._lock:
             sock = self._connect()
             if sock:
                 try:
-                    send_all(sock, handshake_bytes)
+                    send_all(sock, data)
                 except Exception as e:
-                    log.warning(f"Forwarder: handshake send failed — {e}")
-                    self._sock = None
+                    log.warning(f"Forwarder: handshake failed — {e}")
+                    self._close()
 
     def _connect(self):
         if self._sock:
             return self._sock
+        if not self.retry_forever and self._attempt >= self.max_retries > 0:
+            return None
         try:
             raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             raw.settimeout(10)
             raw.connect((self.host, self.port))
             if self.tls:
                 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                if self.ca:
+                if self.ignore_ssl:
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                elif self.ca:
                     ctx.load_verify_locations(self.ca)
                     ctx.verify_mode = ssl.CERT_REQUIRED
                 else:
@@ -181,11 +287,19 @@ class Forwarder:
                 raw = ctx.wrap_socket(raw, server_hostname=self.host)
             raw.settimeout(None)
             self._sock = raw
+            self._attempt = 0
             log.info(f"Forwarder: connected to {self.host}:{self.port}")
         except Exception as e:
-            log.warning(f"Forwarder: cannot connect to {self.host}:{self.port} — {e}")
+            self._attempt += 1
+            log.warning(f"Forwarder: connect failed (attempt {self._attempt}) — {e}")
             self._sock = None
         return self._sock
+
+    def _close(self):
+        if self._sock:
+            try: self._sock.close()
+            except: pass
+        self._sock = None
 
     def _drain(self):
         while not shutdown_event.is_set():
@@ -193,33 +307,35 @@ class Forwarder:
                 payload = self._q.get(timeout=1)
             except queue.Empty:
                 continue
-            while not shutdown_event.is_set():
+
+            sent = False
+            while not sent and not shutdown_event.is_set():
                 with self._lock:
                     sock = self._connect()
                     if not sock:
                         if self.fail_open:
-                            log.warning("Forwarder: no connection, dropping frame")
-                            break
+                            log.warning("Forwarder: no connection — dropping frame (fail-open)")
+                            sent = True
                         else:
-                            import time; time.sleep(2)
-                            continue
+                            time.sleep(self.reconnect_delay)
+                        continue
                     try:
                         send_all(sock, payload)
-                        break
+                        sent = True
                     except Exception as e:
-                        log.warning(f"Forwarder: send failed — {e} — reconnecting")
-                        self._sock = None
+                        log.warning(f"Forwarder: send error — {e} — reconnecting")
+                        self._close()
+                        time.sleep(self.reconnect_delay)
 
 
 # ---------------------------------------------------------------------------
 # Client handler
 # ---------------------------------------------------------------------------
 
-def handle_client(conn, addr, output_file, lock, forwarder):
-    log.info(f"UF connected from {addr[0]}:{addr[1]}")
+def handle_client(conn, addr, cfg: Config, lock, forwarder):
+    log.info(f"UF connected: {addr[0]}:{addr[1]}")
     events_written = 0
     try:
-        # S2S handshake — read raw, relay to indexer, validate locally
         header = read_exactly(conn, S2S_SIGNATURE_LEN)
         if not header.startswith(S2S_SIGNATURE):
             log.warning(f"{addr}: Bad S2S signature {header[:4]!r} — dropping")
@@ -238,89 +354,81 @@ def handle_client(conn, addr, output_file, lock, forwarder):
             frame_len = struct.unpack(">I", len_bytes)[0]
 
             if frame_len == 0:
-                # Keepalive — forward it
                 if forwarder:
-                    forwarder.send(b"", len_bytes, b"")
+                    forwarder.send(len_bytes, b"")
                 continue
 
             if frame_len > 10 * 1024 * 1024:
-                log.warning(f"{addr}: Oversized frame {frame_len}B — dropping connection")
+                log.warning(f"{addr}: Oversized frame {frame_len}B — dropping")
                 break
 
             frame_data = read_exactly(conn, frame_len)
 
-            # --- Forward raw bytes (unchanged, no re-encoding) ---
             if forwarder:
-                forwarder.send(b"", len_bytes, frame_data)
+                forwarder.send(len_bytes, frame_data)
 
-            # --- Decode for local output ---
             fields = decode_kv_block(frame_data)
-            line = format_event(fields, addr[0])
+            line   = format_event(fields, addr[0])
 
             with lock:
-                with open(output_file, "a", encoding="utf-8") as f:
+                with open(cfg.output, "a", encoding="utf-8") as f:
                     f.write(line)
 
             events_written += 1
-            if events_written % 500 == 0:
+            if events_written % cfg.log_every_n == 0:
                 log.info(f"{addr}: {events_written} events written")
 
     except Exception as e:
         log.error(f"{addr}: {e}")
     finally:
         conn.close()
-        log.info(f"{addr}: done — {events_written} events written")
+        log.info(f"{addr}: disconnected — {events_written} events written")
 
 
 # ---------------------------------------------------------------------------
 # Server
 # ---------------------------------------------------------------------------
 
-def make_server_ssl_ctx(cert, key, ca=None):
+def make_server_ssl_ctx(cfg: Config):
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(certfile=cert, keyfile=key)
-    if ca:
-        ctx.load_verify_locations(cafile=ca)
-        ctx.verify_mode = ssl.CERT_REQUIRED
-    else:
+    if cfg.ignore_ssl_in:
+        ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+    ctx.load_cert_chain(certfile=cfg.cert, keyfile=cfg.key)
+    if cfg.ca and cfg.verify_client:
+        ctx.load_verify_locations(cfg.ca)
+        ctx.verify_mode = ssl.CERT_REQUIRED
     return ctx
 
 
-def run_server(args):
-    # Set up forwarder
+def run_server(cfg: Config):
+    cfg.validate()
+
     forwarder = None
-    if args.forward:
-        fwd_host, fwd_port = args.forward.rsplit(":", 1)
-        fwd_port = int(fwd_port)
-        forwarder = Forwarder(
-            host=fwd_host,
-            port=fwd_port,
-            tls=args.forward_tls,
-            cert=args.forward_cert,
-            key=args.forward_key,
-            ca=args.forward_ca,
-            fail_open=args.fail_open,
-        )
-        log.info(f"Forwarding to {fwd_host}:{fwd_port} [TLS={args.forward_tls}, fail_open={args.fail_open}]")
+    if cfg.forward_enabled and cfg.forward_host:
+        forwarder = Forwarder(cfg)
+        mode_str = "fail-open" if cfg.fail_open else "fail-closed"
+        log.info(f"Forwarding -> {cfg.forward_host}:{cfg.forward_port} "
+                 f"[TLS={cfg.forward_tls}, ignore_ssl={cfg.forward_ignore_ssl}, {mode_str}]")
     else:
-        log.info("No --forward specified — local output only")
+        log.info("Forward disabled — local output only")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((args.host, args.port))
+    sock.bind((cfg.host, cfg.port))
     sock.listen(50)
     sock.settimeout(1.0)
 
     ssl_ctx = None
-    if args.tls:
-        ssl_ctx = make_server_ssl_ctx(args.cert, args.key, args.ca)
-        log.info(f"Inbound TLS enabled")
+    if cfg.tls:
+        ssl_ctx = make_server_ssl_ctx(cfg)
+        log.info(f"Inbound TLS enabled [ignore_ssl={cfg.ignore_ssl_in}, verify_client={cfg.verify_client}]")
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(cfg.output)), exist_ok=True)
     lock = threading.Lock()
 
-    log.info(f"Listening on {args.host}:{args.port} — writing to {args.output}")
+    log.setLevel(cfg.log_level)
+    log.info(f"Listening on {cfg.host}:{cfg.port} — writing to {cfg.output}")
 
     def shutdown(sig, frame):
         log.info("Shutting down...")
@@ -349,7 +457,7 @@ def run_server(args):
 
         t = threading.Thread(
             target=handle_client,
-            args=(conn, addr, args.output, lock, forwarder),
+            args=(conn, addr, cfg, lock, forwarder),
             daemon=True
         )
         t.start()
@@ -360,35 +468,58 @@ def run_server(args):
 # ---------------------------------------------------------------------------
 
 def main():
-    p = argparse.ArgumentParser(description="Etairos Log Agent — Splunk S2S tee proxy")
+    p = argparse.ArgumentParser(
+        description="Etairos Log Agent — Splunk S2S tee proxy",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 agent.py --config config.yaml
+  python3 agent.py --config config.yaml --port 9998
+  python3 agent.py --port 9997 --output events.log --forward splunk.corp:9997
+  python3 agent.py --port 9997 --output events.log --forward splunk.corp:9997 \\
+      --tls --cert server.crt --key server.key
+"""
+    )
 
-    # Inbound (from UF)
-    p.add_argument("--host", default="0.0.0.0")
-    p.add_argument("--port", type=int, default=9997)
-    p.add_argument("--output", default="extracted.log", help="Local output file")
-    p.add_argument("--tls", action="store_true", help="Enable TLS on inbound listener")
-    p.add_argument("--cert", help="Server TLS cert (PEM)")
-    p.add_argument("--key", help="Server TLS key (PEM)")
-    p.add_argument("--ca", help="CA cert for client auth (optional)")
+    p.add_argument("--config",        metavar="FILE",      help="Path to config.yaml")
 
-    # Outbound (to real indexer)
-    p.add_argument("--forward", metavar="HOST:PORT",
-                   help="Forward raw stream to this Splunk indexer (e.g. splunk.corp:9997)")
-    p.add_argument("--forward-tls", action="store_true", help="Use TLS when connecting to indexer")
-    p.add_argument("--forward-cert", help="Client cert for indexer TLS auth")
-    p.add_argument("--forward-key", help="Client key for indexer TLS auth")
-    p.add_argument("--forward-ca", help="CA cert to verify indexer cert")
-    p.add_argument("--fail-open", action="store_true", default=True,
-                   help="Drop frames if indexer unreachable (default: true)")
-    p.add_argument("--fail-closed", dest="fail_open", action="store_false",
-                   help="Buffer frames until indexer recovers")
+    # Inbound
+    p.add_argument("--host",          default=None,        help="Bind address (default: 0.0.0.0)")
+    p.add_argument("--port",          type=int,            help="Listen port (default: 9997)")
+    p.add_argument("--output",        metavar="FILE",      help="Output log file path")
+    p.add_argument("--tls",           action="store_true", help="Enable TLS on inbound listener")
+    p.add_argument("--cert",          metavar="FILE",      help="Server TLS cert (PEM)")
+    p.add_argument("--key",           metavar="FILE",      help="Server TLS key (PEM)")
+    p.add_argument("--ca",            metavar="FILE",      help="CA cert for client auth")
+    p.add_argument("--ignore-ssl",    action="store_true", help="Skip all SSL verification (testing only)")
+
+    # Outbound
+    p.add_argument("--forward",       metavar="HOST:PORT", help="Forward to this Splunk indexer")
+    p.add_argument("--forward-tls",   action="store_true", help="Use TLS when connecting to indexer")
+    p.add_argument("--forward-cert",  metavar="FILE",      help="Client cert for indexer TLS")
+    p.add_argument("--forward-key",   metavar="FILE",      help="Client key for indexer TLS")
+    p.add_argument("--forward-ca",    metavar="FILE",      help="CA cert to verify indexer")
+
+    # Failover
+    fg = p.add_mutually_exclusive_group()
+    fg.add_argument("--fail-open",    action="store_true", default=True,
+                    help="Drop frames if indexer unreachable (default)")
+    fg.add_argument("--fail-closed",  action="store_true",
+                    help="Buffer frames in memory until indexer recovers")
 
     args = p.parse_args()
 
-    if args.tls and (not args.cert or not args.key):
-        p.error("--tls requires --cert and --key")
+    cli = {k: v for k, v in vars(args).items() if v is not None and v is not False}
+    # Normalize flag names
+    cli["ignore_ssl"]    = args.ignore_ssl
+    cli["forward_tls"]   = args.forward_tls
+    cli["forward_cert"]  = args.forward_cert
+    cli["forward_key"]   = args.forward_key
+    cli["forward_ca"]    = args.forward_ca
+    cli["fail_closed"]   = args.fail_closed
 
-    run_server(args)
+    cfg = Config(path=args.config, cli_args=cli)
+    run_server(cfg)
 
 
 if __name__ == "__main__":

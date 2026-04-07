@@ -1,0 +1,56 @@
+# etairos-log-agent configuration
+# All CLI flags can be set here. CLI args override config file values.
+# Start with: python3 agent.py --config config.yaml
+
+# ---------------------------------------------------------------------------
+# Inbound listener (from Splunk Universal Forwarder)
+# ---------------------------------------------------------------------------
+listener:
+  host: "0.0.0.0"       # bind address — use 0.0.0.0 for all interfaces
+  port: 9997             # port UF connects to (default Splunk S2S port)
+
+  tls:
+    enabled: false       # set true to require TLS from UF
+    cert: ""             # path to server certificate PEM  e.g. /etc/etairos/certs/server.crt
+    key: ""              # path to server private key PEM  e.g. /etc/etairos/certs/server.key
+    ca: ""               # path to CA cert for client auth (optional — leave blank to skip client auth)
+    verify_client: false # true = require UF to present a cert signed by ca above
+    ignore_ssl: false    # true = accept any UF cert, skip all verification (testing only)
+
+# ---------------------------------------------------------------------------
+# Local output (decoded events written to disk)
+# ---------------------------------------------------------------------------
+output:
+  file: "/var/log/etairos/events.log"   # absolute path to output file
+  # Future: type: s3 | webhook | stdout
+  # Future: s3_bucket, s3_prefix, webhook_url
+
+# ---------------------------------------------------------------------------
+# Forward (upstream to real Splunk indexer)
+# ---------------------------------------------------------------------------
+forward:
+  enabled: true
+  host: ""               # indexer hostname or IP  e.g. splunk-indexer.corp
+  port: 9997             # indexer S2S port (almost always 9997)
+
+  tls:
+    enabled: false       # set true if indexer requires TLS
+    cert: ""             # client cert PEM for mutual TLS  e.g. /etc/etairos/certs/client.crt
+    key: ""              # client key PEM                  e.g. /etc/etairos/certs/client.key
+    ca: ""               # CA cert to verify indexer cert  e.g. /etc/etairos/certs/ca.crt
+    ignore_ssl: false    # true = skip indexer cert verification (testing only — never in prod)
+
+  failover:
+    mode: "fail-open"    # fail-open  = drop frames if indexer down, keep writing locally
+                         # fail-closed = buffer frames in memory until indexer recovers
+    queue_max: 100000    # max frames to buffer in fail-closed mode before dropping oldest
+    reconnect_delay: 2   # seconds between reconnect attempts when indexer is unreachable
+    retry_forever: true  # true = keep retrying forever; false = give up after max_retries
+    max_retries: 0       # 0 = unlimited (only used when retry_forever: false)
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  level: "INFO"          # DEBUG | INFO | WARNING | ERROR
+  log_every_n: 500       # log a progress line every N events per connection
