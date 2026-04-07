@@ -1,0 +1,17 @@
+[Unit]
+Description=Etairos Log Agent — Splunk S2S Tee Proxy
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/etairos-log-agent/agent.py \
+  --port 9997 \
+  --output /var/log/etairos/events.log \
+  --forward splunk-indexer.corp:9997
+Restart=always
+RestartSec=5
+User=etairos
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

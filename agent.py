@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
 """
-Etairos Log Agent
-Listens for Splunk Universal Forwarder S2S connections on port 9997 (or TLS),
-decodes the wire protocol, and writes extracted log events to a file.
+Etairos Log Agent — S2S Tee Proxy
+Sits between Splunk UF and your real indexer. Receives the UF stream,
+decodes events for local output (file, future lakehouse), and simultaneously
+forwards the raw bytes upstream to the real indexer unchanged.
 
-S2S Protocol Notes:
-- UF sends a "signature" (4 bytes: '--CH') then streams key-value pairs
-- Each KV block: 4-byte big-endian length + data
-- Fields encoded as: 4-byte key-len + key + 4-byte val-len + val
-- The "_raw" field contains the actual log line
+Architecture:
+  [Splunk UF] --> [etairos-log-agent :9997] --> [Real Splunk Indexer :9997]
+                                             \-> [output file / lakehouse]
 
 Usage:
-  Plain:  python3 agent.py --port 9997 --output /var/log/splunk-extracted.log
-  TLS:    python3 agent.py --port 9997 --output /var/log/splunk-extracted.log \
-            --tls --cert server.crt --key server.key [--ca ca.crt]
+  Plain (no TLS):
+    python3 agent.py --port 9997 --output events.log --forward splunk-indexer.corp:9997
+
+  TLS inbound + plain forward:
+    python3 agent.py --port 9997 --output events.log --forward splunk-indexer.corp:9997 \
+      --tls --cert server.crt --key server.key
+
+  TLS both directions:
+    python3 agent.py --port 9997 --output events.log --forward splunk-indexer.corp:9997 \
+      --tls --cert server.crt --key server.key \
+      --forward-tls --forward-cert client.crt --forward-key client.key [--forward-ca ca.crt]
+
+outputs.conf on UF (change only the server address):
+  [tcpout:etairos-tee]
+  server = <this-host-ip>:9997
 """
 
 import socket
@@ -23,6 +34,7 @@ import threading
 import argparse
 import logging
 import os
+import queue
 import signal
 import sys
 from datetime import datetime, timezone
@@ -34,15 +46,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("etairos-log-agent")
 
-# Splunk S2S signature header
 S2S_SIGNATURE = b"--CH"
-S2S_SIGNATURE_LEN = 128  # full handshake block is 128 bytes
+S2S_SIGNATURE_LEN = 128
 
 shutdown_event = threading.Event()
 
 
+# ---------------------------------------------------------------------------
+# Socket helpers
+# ---------------------------------------------------------------------------
+
 def read_exactly(sock, n):
-    """Read exactly n bytes from socket."""
     buf = b""
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -52,12 +66,20 @@ def read_exactly(sock, n):
     return buf
 
 
+def send_all(sock, data):
+    total = 0
+    while total < len(data):
+        sent = sock.send(data[total:])
+        if sent == 0:
+            raise ConnectionResetError("Forward socket closed")
+        total += sent
+
+
+# ---------------------------------------------------------------------------
+# S2S decode (for local output only — forward uses raw bytes)
+# ---------------------------------------------------------------------------
+
 def decode_kv_block(data):
-    """
-    Decode a Splunk S2S key-value block.
-    Format: [4-byte key-len][key][4-byte val-len][val] repeated
-    Returns dict of fields.
-    """
     fields = {}
     offset = 0
     while offset < len(data):
@@ -69,81 +91,192 @@ def decode_kv_block(data):
             break
         key = data[offset:offset+key_len].decode("utf-8", errors="replace")
         offset += key_len
-
         if offset + 4 > len(data):
             break
         val_len = struct.unpack(">I", data[offset:offset+4])[0]
         offset += 4
         val = data[offset:offset+val_len].decode("utf-8", errors="replace")
         offset += val_len
-
         fields[key] = val
-
     return fields
 
 
-def handle_client(conn, addr, output_file, lock):
-    """Handle a single UF connection."""
-    log.info(f"Connection from {addr[0]}:{addr[1]}")
+def format_event(fields, fallback_ip):
+    raw = fields.get("_raw", "")
+    if not raw:
+        raw = " | ".join(f"{k}={v}" for k, v in fields.items() if not k.startswith("_"))
+    source = fields.get("source", "unknown")
+    host = fields.get("host", fallback_ip)
+    sourcetype = fields.get("sourcetype", "unknown")
+    ts = fields.get("_time", "") or datetime.now(timezone.utc).isoformat()
+    return f"[{ts}] host={host} source={source} sourcetype={sourcetype} | {raw}\n"
+
+
+# ---------------------------------------------------------------------------
+# Forward connection manager (reconnects on failure)
+# ---------------------------------------------------------------------------
+
+class Forwarder:
+    """
+    Maintains a persistent connection to the real indexer.
+    Queues raw frame bytes; background thread drains the queue.
+    fail_open=True: drop frames if indexer is unreachable (default).
+    fail_open=False: buffer indefinitely (risk: memory growth if indexer is down long).
+    """
+
+    def __init__(self, host, port, tls=False, cert=None, key=None, ca=None,
+                 fail_open=True, queue_max=100_000):
+        self.host = host
+        self.port = port
+        self.tls = tls
+        self.cert = cert
+        self.key = key
+        self.ca = ca
+        self.fail_open = fail_open
+        self._q = queue.Queue(maxsize=queue_max)
+        self._sock = None
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._drain, daemon=True, name="forwarder")
+        self._thread.start()
+
+    def send(self, raw_header, frame_len_bytes, frame_data):
+        """Enqueue a raw frame (header + length prefix + body) for forwarding."""
+        payload = raw_header + frame_len_bytes + frame_data
+        try:
+            self._q.put_nowait(payload)
+        except queue.Full:
+            if self.fail_open:
+                log.warning("Forward queue full — dropping frame (fail_open=True)")
+            else:
+                self._q.put(payload)  # block
+
+    def send_handshake(self, handshake_bytes):
+        """Send the raw S2S handshake to the indexer immediately (called once per UF conn)."""
+        with self._lock:
+            sock = self._connect()
+            if sock:
+                try:
+                    send_all(sock, handshake_bytes)
+                except Exception as e:
+                    log.warning(f"Forwarder: handshake send failed — {e}")
+                    self._sock = None
+
+    def _connect(self):
+        if self._sock:
+            return self._sock
+        try:
+            raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            raw.settimeout(10)
+            raw.connect((self.host, self.port))
+            if self.tls:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                if self.ca:
+                    ctx.load_verify_locations(self.ca)
+                    ctx.verify_mode = ssl.CERT_REQUIRED
+                else:
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                if self.cert and self.key:
+                    ctx.load_cert_chain(self.cert, self.key)
+                raw = ctx.wrap_socket(raw, server_hostname=self.host)
+            raw.settimeout(None)
+            self._sock = raw
+            log.info(f"Forwarder: connected to {self.host}:{self.port}")
+        except Exception as e:
+            log.warning(f"Forwarder: cannot connect to {self.host}:{self.port} — {e}")
+            self._sock = None
+        return self._sock
+
+    def _drain(self):
+        while not shutdown_event.is_set():
+            try:
+                payload = self._q.get(timeout=1)
+            except queue.Empty:
+                continue
+            while not shutdown_event.is_set():
+                with self._lock:
+                    sock = self._connect()
+                    if not sock:
+                        if self.fail_open:
+                            log.warning("Forwarder: no connection, dropping frame")
+                            break
+                        else:
+                            import time; time.sleep(2)
+                            continue
+                    try:
+                        send_all(sock, payload)
+                        break
+                    except Exception as e:
+                        log.warning(f"Forwarder: send failed — {e} — reconnecting")
+                        self._sock = None
+
+
+# ---------------------------------------------------------------------------
+# Client handler
+# ---------------------------------------------------------------------------
+
+def handle_client(conn, addr, output_file, lock, forwarder):
+    log.info(f"UF connected from {addr[0]}:{addr[1]}")
+    events_written = 0
     try:
-        # Read and validate S2S handshake signature
+        # S2S handshake — read raw, relay to indexer, validate locally
         header = read_exactly(conn, S2S_SIGNATURE_LEN)
         if not header.startswith(S2S_SIGNATURE):
-            log.warning(f"{addr}: Invalid S2S signature, got {header[:4]!r} — dropping")
+            log.warning(f"{addr}: Bad S2S signature {header[:4]!r} — dropping")
             return
         log.info(f"{addr}: S2S handshake OK")
 
-        events_written = 0
+        if forwarder:
+            forwarder.send_handshake(header)
+
         while not shutdown_event.is_set():
-            # Each S2S frame: 4-byte length prefix
             try:
-                raw_len_bytes = read_exactly(conn, 4)
+                len_bytes = read_exactly(conn, 4)
             except ConnectionResetError:
                 break
-            frame_len = struct.unpack(">I", raw_len_bytes)[0]
+
+            frame_len = struct.unpack(">I", len_bytes)[0]
 
             if frame_len == 0:
-                # Keepalive / heartbeat
+                # Keepalive — forward it
+                if forwarder:
+                    forwarder.send(b"", len_bytes, b"")
                 continue
-            if frame_len > 10 * 1024 * 1024:  # 10MB sanity cap
-                log.warning(f"{addr}: Oversized frame {frame_len} bytes, dropping connection")
+
+            if frame_len > 10 * 1024 * 1024:
+                log.warning(f"{addr}: Oversized frame {frame_len}B — dropping connection")
                 break
 
             frame_data = read_exactly(conn, frame_len)
+
+            # --- Forward raw bytes (unchanged, no re-encoding) ---
+            if forwarder:
+                forwarder.send(b"", len_bytes, frame_data)
+
+            # --- Decode for local output ---
             fields = decode_kv_block(frame_data)
-
-            # Extract the raw log line (primary field)
-            raw = fields.get("_raw", "")
-            if not raw:
-                # Fall back to assembling visible fields
-                raw = " | ".join(f"{k}={v}" for k, v in fields.items() if not k.startswith("_"))
-
-            # Build output line with metadata
-            source = fields.get("source", "unknown")
-            host = fields.get("host", addr[0])
-            sourcetype = fields.get("sourcetype", "unknown")
-            ts = fields.get("_time", "")
-            if not ts:
-                ts = datetime.now(timezone.utc).isoformat()
-
-            line = f"[{ts}] host={host} source={source} sourcetype={sourcetype} | {raw}\n"
+            line = format_event(fields, addr[0])
 
             with lock:
                 with open(output_file, "a", encoding="utf-8") as f:
                     f.write(line)
 
             events_written += 1
-            if events_written % 100 == 0:
+            if events_written % 500 == 0:
                 log.info(f"{addr}: {events_written} events written")
 
     except Exception as e:
-        log.error(f"{addr}: Error — {e}")
+        log.error(f"{addr}: {e}")
     finally:
         conn.close()
-        log.info(f"{addr}: Connection closed ({events_written if 'events_written' in dir() else 0} events)")
+        log.info(f"{addr}: done — {events_written} events written")
 
 
-def make_ssl_context(cert, key, ca=None):
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+
+def make_server_ssl_ctx(cert, key, ca=None):
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(certfile=cert, keyfile=key)
     if ca:
@@ -154,27 +287,45 @@ def make_ssl_context(cert, key, ca=None):
     return ctx
 
 
-def run_server(host, port, output_file, tls=False, cert=None, key=None, ca=None):
-    raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    raw_sock.bind((host, port))
-    raw_sock.listen(50)
-    raw_sock.settimeout(1.0)
+def run_server(args):
+    # Set up forwarder
+    forwarder = None
+    if args.forward:
+        fwd_host, fwd_port = args.forward.rsplit(":", 1)
+        fwd_port = int(fwd_port)
+        forwarder = Forwarder(
+            host=fwd_host,
+            port=fwd_port,
+            tls=args.forward_tls,
+            cert=args.forward_cert,
+            key=args.forward_key,
+            ca=args.forward_ca,
+            fail_open=args.fail_open,
+        )
+        log.info(f"Forwarding to {fwd_host}:{fwd_port} [TLS={args.forward_tls}, fail_open={args.fail_open}]")
+    else:
+        log.info("No --forward specified — local output only")
 
-    if tls:
-        ssl_ctx = make_ssl_context(cert, key, ca)
-        log.info(f"TLS enabled (cert={cert}, key={key}, ca={ca or 'none — no client auth'})")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((args.host, args.port))
+    sock.listen(50)
+    sock.settimeout(1.0)
 
-    mode = "TLS" if tls else "plaintext"
-    log.info(f"Etairos Log Agent listening on {host}:{port} [{mode}]")
-    log.info(f"Writing events to: {output_file}")
+    ssl_ctx = None
+    if args.tls:
+        ssl_ctx = make_server_ssl_ctx(args.cert, args.key, args.ca)
+        log.info(f"Inbound TLS enabled")
 
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     lock = threading.Lock()
+
+    log.info(f"Listening on {args.host}:{args.port} — writing to {args.output}")
 
     def shutdown(sig, frame):
         log.info("Shutting down...")
         shutdown_event.set()
-        raw_sock.close()
+        sock.close()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
@@ -182,13 +333,13 @@ def run_server(host, port, output_file, tls=False, cert=None, key=None, ca=None)
 
     while not shutdown_event.is_set():
         try:
-            conn, addr = raw_sock.accept()
+            conn, addr = sock.accept()
         except socket.timeout:
             continue
         except OSError:
             break
 
-        if tls:
+        if ssl_ctx:
             try:
                 conn = ssl_ctx.wrap_socket(conn, server_side=True)
             except ssl.SSLError as e:
@@ -196,28 +347,48 @@ def run_server(host, port, output_file, tls=False, cert=None, key=None, ca=None)
                 conn.close()
                 continue
 
-        t = threading.Thread(target=handle_client, args=(conn, addr, output_file, lock), daemon=True)
+        t = threading.Thread(
+            target=handle_client,
+            args=(conn, addr, args.output, lock, forwarder),
+            daemon=True
+        )
         t.start()
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main():
-    parser = argparse.ArgumentParser(description="Etairos Log Agent — Splunk S2S receiver")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=9997, help="Listen port (default: 9997)")
-    parser.add_argument("--output", default="extracted.log", help="Output log file path")
-    parser.add_argument("--tls", action="store_true", help="Enable TLS")
-    parser.add_argument("--cert", help="TLS certificate file (PEM)")
-    parser.add_argument("--key", help="TLS private key file (PEM)")
-    parser.add_argument("--ca", help="CA cert for client auth (optional)")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Etairos Log Agent — Splunk S2S tee proxy")
+
+    # Inbound (from UF)
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--port", type=int, default=9997)
+    p.add_argument("--output", default="extracted.log", help="Local output file")
+    p.add_argument("--tls", action="store_true", help="Enable TLS on inbound listener")
+    p.add_argument("--cert", help="Server TLS cert (PEM)")
+    p.add_argument("--key", help="Server TLS key (PEM)")
+    p.add_argument("--ca", help="CA cert for client auth (optional)")
+
+    # Outbound (to real indexer)
+    p.add_argument("--forward", metavar="HOST:PORT",
+                   help="Forward raw stream to this Splunk indexer (e.g. splunk.corp:9997)")
+    p.add_argument("--forward-tls", action="store_true", help="Use TLS when connecting to indexer")
+    p.add_argument("--forward-cert", help="Client cert for indexer TLS auth")
+    p.add_argument("--forward-key", help="Client key for indexer TLS auth")
+    p.add_argument("--forward-ca", help="CA cert to verify indexer cert")
+    p.add_argument("--fail-open", action="store_true", default=True,
+                   help="Drop frames if indexer unreachable (default: true)")
+    p.add_argument("--fail-closed", dest="fail_open", action="store_false",
+                   help="Buffer frames until indexer recovers")
+
+    args = p.parse_args()
 
     if args.tls and (not args.cert or not args.key):
-        parser.error("--tls requires --cert and --key")
+        p.error("--tls requires --cert and --key")
 
-    # Ensure output dir exists
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-
-    run_server(args.host, args.port, args.output, args.tls, args.cert, args.key, args.ca)
+    run_server(args)
 
 
 if __name__ == "__main__":
