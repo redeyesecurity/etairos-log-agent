@@ -1,0 +1,51 @@
+# Etairos Tee Configuration
+# Edit this file or override in local/config.yaml
+
+listener:
+  host: "127.0.0.1"
+  port: 19997
+
+forward:
+  enabled: true
+  host: ""              # REQUIRED: your Splunk indexer hostname/IP
+  port: 9997
+  
+  tls:
+    enabled: false
+    cert: ""
+    key: ""
+    ca: ""
+    ignore_ssl: false
+  
+  failover:
+    mode: "fail-open"
+    queue_max: 100000
+    reconnect_delay: 2
+
+lakehouse:
+  enabled: true
+  destination: "local-json"   # local-json | local-parquet | s3
+  
+  # Local path (use forward slashes even on Windows)
+  path: "/var/log/etairos/lakehouse"
+  
+  # S3 settings
+  s3:
+    bucket: ""
+    prefix: "etairos/ocsf"
+    region: "us-east-1"
+    access_key: ""
+    secret_key: ""
+  
+  batch_size: 1000
+  flush_interval: 60
+  partition_by: "day"
+
+ack:
+  enabled: auto
+  mode: simple
+  window_size: 1
+
+logging:
+  level: "INFO"
+  log_every_n: 500
