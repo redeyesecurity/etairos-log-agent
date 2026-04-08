@@ -410,14 +410,18 @@ class TeeListener:
                         # Only emit if the text is mostly printable ASCII (not binary)
                         printable_ratio = sum(1 for c in raw_text if c.isprintable() or c in "\n\t\r") / max(len(raw_text), 1)
                         if printable_ratio > 0.85 and len(raw_text) > 5:
-                            events.append({
-                                "_time": time.time(),
-                                "_raw": raw_text,
-                                "host": "Mac.lucashouse.info",
-                                "source": src_path,
-                                "sourcetype": "splunkd",
-                                "index": last_index,
-                            })
+                            # Split multi-line events into individual events
+                            for line in raw_text.split("\n"):
+                                line = line.strip()
+                                if len(line) > 5:
+                                    events.append({
+                                        "_time": time.time(),
+                                        "_raw": line,
+                                        "host": "Mac.lucashouse.info",
+                                        "source": src_path,
+                                        "sourcetype": "splunkd",
+                                        "index": last_index,
+                                    })
                     pos = event_end
 
         return buf[offset:], events
