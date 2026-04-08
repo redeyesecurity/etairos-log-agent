@@ -307,13 +307,14 @@
 
 | Goal | Config |
 |------|--------|
-| **Shadow mode** (test alternate_stream, keep Splunk) | `forward.enabled: true`, `alternate_stream.enabled: true` |
-| **Alternate Stream only** | `forward.enabled: false`, `alternate_stream.enabled: true` |
+| **UF multi-output** (recommended) | UF `outputs.conf` with two target groups; tee: `forward.enabled: false` |
+| **Proxy mode** (inline forwarding) | `forward.enabled: true`, `forward.host: splunk-idx` |
+| **Tee only** (no Splunk) | `forward.enabled: false`, `alternate_stream.enabled: true` |
 | **Local files only** (debugging) | `forward.enabled: false`, `alternate_stream.enabled: false`, `output.file: /path` |
-| **Splunk passthrough** (just decode) | `forward.enabled: true`, `alternate_stream.enabled: false` |
-| **S3 alternate_stream** | `alternate_stream.destination: s3`, fill `alternate_stream.s3.*` |
+| **S3 lakehouse** | `alternate_stream.destination: s3`, fill `alternate_stream.s3.*` |
 | **Local Parquet** | `alternate_stream.destination: local-parquet` |
 | **Local JSON** | `alternate_stream.destination: local-json` |
+| **Kafka** | `alternate_stream.destination: kafka`, fill `alternate_stream.kafka.*` |
 | **TLS everywhere** | `listener.tls.enabled: true`, `forward.tls.enabled: true` |
 | **Fail-closed** | `forward.failover.mode: fail-closed` |
 

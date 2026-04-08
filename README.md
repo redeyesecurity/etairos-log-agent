@@ -92,13 +92,79 @@ index=_internal sourcetype=etairos:tee:log
 
 All settings in `local/config.yaml` (create from `default/config.yaml`).
 
-### Minimum required
+### Deployment Mode: UF Multi-Output vs Proxy Forwarding
+
+You have two options for getting data to both Splunk and the lakehouse:
+
+#### Option A: UF Multi-Output (Recommended)
+
+Configure the UF to send to both destinations natively:
+
+```ini
+# outputs.conf on the UF
+[tcpout]
+defaultGroup = splunk_indexers, lakehouse_tee
+
+[tcpout:splunk_indexers]
+server = splunk-idx1:9997, splunk-idx2:9997
+
+[tcpout:lakehouse_tee]
+server = 127.0.0.1:19997
+useACK = false
+compressed = false
+```
+
+```yaml
+# config.yaml for the tee
+forward:
+  enabled: false   # <-- tee only, no proxy forwarding
+
+alternate_stream:
+  enabled: true
+  destination: "s3"  # or local-json, kafka, etc.
+```
+
+**Advantages:**
+- No single point of failure — if tee dies, Splunk still gets data
+- No added latency — parallel writes, not serial
+- Splunk gets 100% original bytes untouched
+- Simpler tee code — parse only, no forwarding logic
+
+#### Option B: Proxy Forwarding
+
+Tee sits inline and forwards to Splunk:
+
+```
+UF → Tee → Splunk Indexer
+          └→ Lakehouse
+```
+
+```yaml
+# config.yaml
+forward:
+  enabled: true
+  host: "splunk-indexer.corp"
+  port: 9997
+
+alternate_stream:
+  enabled: true
+```
+
+**Use when:**
+- You can't modify UF outputs.conf (managed by deployment server you don't control)
+- You need to filter/transform data before it reaches Splunk
+- Single egress point is required (firewall rules)
+
+### Minimum required (tee-only mode)
 
 ```yaml
 forward:
+  enabled: false
+
+alternate_stream:
   enabled: true
-  host: "splunk-indexer.corp"   # your real indexer
-  port: 9997
+  destination: "local-json"
+  path: "/var/log/etairos/events"
 ```
 
 ### Enable an alternate destination
