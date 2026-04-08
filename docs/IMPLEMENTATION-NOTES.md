@@ -212,14 +212,46 @@ Observed metrics (Mac M1, UF 9.4.3):
 - Parse rate: ~99.7% of bytes consumed
 - Latency: <1 second from UF receive to file write
 
+## Protocol Version Selection (v2 vs v3)
+
+The tee controls which S2S version the UF uses by what it sends in the IX response.
+
+**Default (v3):** Send the full 163-byte IX response with `v4=true;channel_limit=300;pl=6`.
+The UF uses S2S v3 channel-multiplexed framing. Tee parser handles this at ~99.7%.
+
+**v2 fallback:** Send a stripped-down IX response without v3/v4 capability flags.
+The UF falls back to S2S v2 framing (simpler 8-byte length-prefixed frames).
+
+**Important:** Only enable v2 on the tee if your production Splunk indexers **also
+support v2**. Modern indexers (8.x, 9.x) support both, but verify before changing.
+
+```python
+# In listener.py, to request v2 framing from the UF:
+# Replace IX_RESPONSE with this stripped version:
+IX_RESPONSE_V2 = bytes.fromhex(
+    "0000003800000001000000125f5f7332735f636f6e74726f6c5f6d736700"
+    "000000146361705f726573706f6e73653d737563636573730000000000000000055f72617700"
+)
+```
+
+The `negotiateNewProtocol=false` and `negotiateProtocolLevel=0` UF settings do NOT
+reliably force v2. The receiver's response is what drives the negotiation.
+
+Each UF output group negotiates independently — your production indexer group can
+use v3 while the tee group uses v2, simultaneously, with no conflict.
+
 ## Known Limitations
 
-1. **No forwarding to downstream indexer** — This is a tee/tap, not a proxy. Events are extracted but not forwarded. Add forwarding logic if needed.
+1. **No forwarding to downstream indexer** — This is a tee/tap, not a proxy. Use UF
+   multi-output (`defaultGroup = splunk_idx, lakehouse_tee`) instead of proxy forwarding.
 
-2. **No ACK support** — `useACK=false` required. ACK mode uses different framing.
+2. **No ACK support** — `useACK=false` required on the tee output group. ACK mode
+   uses different framing that the tee does not implement.
 
 3. **No compression** — `compressed=false` required. Compression not implemented.
 
-4. **Binary log formats filtered** — conf.log, btool.log, etc. are binary and excluded.
+4. **Binary log formats filtered** — conf.log, btool.log, etc. are binary and excluded
+   by the printability filter (>85% printable chars required).
 
-5. **Source path truncation** — Minor bug, path may be truncated by a few characters.
+5. **Source path truncation** — Minor cosmetic bug, path may be truncated by a few
+   characters due to channel re-use in the UF.

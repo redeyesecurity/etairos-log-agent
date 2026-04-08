@@ -315,14 +315,114 @@ with open('/tmp/s2s.pcap', 'rb') as f:
 
 | Version | Notes |
 |---------|-------|
-| S2S v2  | Simpler framing, deprecated |
+| S2S v2  | Simpler framing, deprecated in modern Splunk |
 | S2S v3  | Channel-multiplexed, this document |
-| S2S v4  | Mentioned in IX response (`v4=true`) but not observed in use |
+| S2S v4  | Advertised in IX response (`v4=true`) but not fully observed in use |
+
+---
+
+## Protocol Negotiation — UF Multi-Destination Behavior
+
+### Key Insight
+
+The UF negotiates the S2S protocol version **independently with each destination**. When
+you configure multiple output target groups in `outputs.conf`, each connection goes through
+its own handshake. The UF does not know or care that two destinations are receiving the
+same data — they are treated as completely separate connections.
+
+This means:
+- Your production Splunk indexer can use S2S v3 (with ACK, full capabilities)
+- Your tee/lakehouse listener can receive S2S v2 (simpler, easier to parse)
+- The UF handles both simultaneously with no conflict
+
+### How the UF Chooses Protocol Version
+
+The UF starts every connection by sending a v3 hello (400-byte struct with
+`--splunk-cooked-mode-v3--` signature). It then advertises its capabilities.
+
+The **receiver's IX response** drives what protocol is actually used:
+
+| IX Response Contains | UF Uses |
+|---------------------|--------|
+| `v4=true;channel_limit=300;pl=6` | S2S v3 (full) |
+| `cap_response=success` only (no v4) | S2S v2 fallback |
+| Connection rejected | UF retries with backoff |
+
+So the tee controls the negotiation by what it sends back.
+
+### Forcing S2S v2 on the Tee
+
+**Only do this if your production Splunk indexers also support v2** (Splunk 6.0+).
+Modern indexers (8.x, 9.x) support both — but check your environment first.
+
+To make the UF use v2 for the tee connection, send a stripped-down IX response
+that omits the v3/v4 capability flags:
+
+```python
+# Minimal IX response — no v4, no channel_limit, no pl
+# This causes the UF to fall back to S2S v2 framing
+IX_RESPONSE_V2 = bytes.fromhex(
+    "0000003800000001000000125f5f7332735f636f6e74726f6c5f6d736700"
+    "000000146361705f726573706f6e73653d737563636573730000000000000000055f72617700"
+)
+```
+
+### `negotiateNewProtocol = false` Does NOT Force v2
+
+This is a common misconception. From Splunk docs:
+
+> If you give `negotiateProtocolLevel` a value of 0, or `negotiateNewProtocol` a
+> value of `false`, the forwarder will instead **override these settings to use the
+> lowest protocol version that all instances support.**
+
+In practice: UF 9.x with `negotiateNewProtocol=false` still sends a v3 hello and
+still uses v3 if the receiver accepts it. The setting is advisory, not a hard cap.
+
+The only reliable way to get v2 framing is to have the **receiver send a v2-only
+IX response**.
+
+### UF `outputs.conf` — Per-Group Settings
+
+Each `[tcpout:<group>]` stanza is fully independent. Settings that can differ per group:
+
+```ini
+[tcpout]
+defaultGroup = splunk_prod, lakehouse_tee
+
+[tcpout:splunk_prod]
+server = splunk-idx1:9997
+useACK = true          # ACK enabled for production
+compressed = false
+
+[tcpout:lakehouse_tee]
+server = 127.0.0.1:19997
+useACK = false         # No ACK needed for tee
+compressed = false
+# Note: protocol version is controlled by what the receiver advertises,
+# not by these settings. See negotiation notes above.
+```
+
+Settings that are **global only** (top `[tcpout]` stanza, not per-group):
+- `enableOldS2SProtocol` — allows use of pre-v3 protocol globally
+- `indexAndForward` — only on heavy forwarders
+
+### Recommendation
+
+| Scenario | Protocol Setting |
+|----------|------------------|
+| Indexer supports v3 (Splunk 6.0+) | Let tee respond with v3 (default) |
+| Want simpler tee parsing, indexer supports v2 | Send v2 IX response from tee |
+| Indexer is very old (pre-6.0) | Use v2 IX response, set `enableOldS2SProtocol=true` globally |
+| Mixed environment | Use v3 everywhere — our parser handles it at 99.7% |
+
+**Default recommendation:** Use S2S v3 for both connections. The tee parser handles
+v3 correctly. Only switch to v2 if you have a specific reason (very old indexers,
+or you want to implement a simpler parser for the tee side).
 
 ---
 
 ## References
 
-- Splunk docs mention S2S but don't document wire format
-- This document based on empirical packet capture, April 2026
-- Tested with: UF 9.4.3 (Darwin arm64) → IX 9.1 (Linux amd64)
+- Splunk docs: https://docs.splunk.com/Documentation/Splunk/latest/Admin/Outputsconf
+- S2S protocol not officially documented; this doc based on empirical packet capture
+- Tested with: UF 9.4.3 (Darwin arm64) → IX 9.1 (Linux amd64), April 2026
