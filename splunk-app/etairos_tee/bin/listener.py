@@ -349,7 +349,10 @@ class TeeListener:
 
             # Extract events from the segment
             if chan == "_path" and segment:
-                last_path = segment.rstrip(b"\x00").decode("utf-8", errors="replace")
+                raw_path = segment.rstrip(b"\x00").decode("utf-8", errors="replace")
+                # Strip length-byte prefix artifact — path always starts with /
+                slash = raw_path.find("/")
+                last_path = raw_path[slash:] if slash >= 0 else raw_path
             elif chan == "_MetaData:Index" and len(segment) > 6:
                 # Format: 4-byte index_len + index_name + \xa1\x01 + log_text
                 # Or sometimes: just \xa1\x01 + log_text (no index prefix)
