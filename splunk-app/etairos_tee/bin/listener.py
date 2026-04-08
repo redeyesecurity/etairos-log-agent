@@ -350,9 +350,17 @@ class TeeListener:
             # Extract events from the segment
             if chan == "_path" and segment:
                 raw_path = segment.rstrip(b"\x00").decode("utf-8", errors="replace")
-                # Strip length-byte prefix artifact — path always starts with /
-                slash = raw_path.find("/")
-                last_path = raw_path[slash:] if slash >= 0 else raw_path
+                # Strip length-byte prefix artifact
+                # Unix paths start with /, Windows paths start with drive letter (C:\)
+                unix_slash = raw_path.find("/")
+                win_colon = raw_path.find(":\\")
+                if win_colon > 0 and (unix_slash < 0 or win_colon < unix_slash):
+                    # Windows path: strip to one char before the colon (drive letter)
+                    last_path = raw_path[win_colon - 1:]
+                elif unix_slash >= 0:
+                    last_path = raw_path[unix_slash:]
+                else:
+                    last_path = raw_path
             elif chan == "_MetaData:Index" and len(segment) > 6:
                 # Format: 4-byte index_len + index_name + \xa1\x01 + log_text
                 # Or sometimes: just \xa1\x01 + log_text (no index prefix)
