@@ -9,6 +9,7 @@ import ssl
 import struct
 import threading
 import queue
+import re
 import time
 import json
 import os
@@ -410,13 +411,16 @@ class TeeListener:
                         # Only emit if the text is mostly printable ASCII (not binary)
                         printable_ratio = sum(1 for c in raw_text if c.isprintable() or c in "\n\t\r") / max(len(raw_text), 1)
                         if printable_ratio > 0.85 and len(raw_text) > 5:
-                            # Split multi-line events into individual events
-                            for line in raw_text.split("\n"):
-                                line = line.strip()
-                                if len(line) > 5:
+                            # Split on Splunk timestamp pattern (MM-DD-YYYY HH:MM:SS)
+                            # This preserves multiline events like stack traces
+                            ts_pattern = r'(?=\d{2}-\d{2}-\d{4} \d{2}:\d{2}:\d{2})'
+                            event_chunks = re.split(ts_pattern, raw_text)
+                            for chunk in event_chunks:
+                                chunk = chunk.strip()
+                                if len(chunk) > 10:
                                     events.append({
                                         "_time": time.time(),
-                                        "_raw": line,
+                                        "_raw": chunk,
                                         "host": "Mac.lucashouse.info",
                                         "source": src_path,
                                         "sourcetype": "splunkd",
