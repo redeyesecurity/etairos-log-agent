@@ -31,7 +31,7 @@ Total: 400 bytes
 **Example (hex):**
 ```
 2d2d73706c756e6b2d636f6f6b65642d6d6f64652d76332d2d00...  # --splunk-cooked-mode-v3--
-4d61632e6c75636173686f7573652e696e666f00...              # Mac.lucashouse.info
+4d61632e6c75636173686f7573652e696e666f00...              # Mac.hostname.info
 38303839000000...                                         # 8089
 ```
 
@@ -198,7 +198,7 @@ Within channel segments, metadata fields use length-prefixed encoding with type 
 **Example structure:**
 ```
 /splunk/etairos_tee.log      # source path
-\x1a host::Mac.lucashouse.info
+\x1a host::Mac.hostname.info
 \x1c sourcetype::etairos:tee:log
 \x03 69                       # event count
 \x00 \xfc \x01 ...           # binary separator
@@ -214,7 +214,7 @@ The first event from a UF connection is always a `ForwarderInfo` line:
 
 ```
 ForwarderInfo build=237ebbd22314 version=9.4.3 os=Darwin arch=arm64 
-hostname=Mac.lucashouse.info guid=50CBCAB4-9A1A-4412-94B2-9A487DBE3395 
+hostname=Mac.hostname.info guid=50CBCAB4-9A1A-4412-94B2-9A487DBE3395 
 mgmt=8089 useACK=false
 ```
 
