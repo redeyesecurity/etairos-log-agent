@@ -197,6 +197,8 @@ C:\Program Files\SplunkUniversalForwarder\var\log\splunk\etairos_tee.log
 ## Standalone Mode (Advanced)
 
 > **This is not the primary deployment model.** The Splunk app is recommended for almost all cases. Standalone mode exists for environments where you cannot or do not want to deploy a Splunk app — for example, a non-Splunk forwarder, a custom pipeline, or a development environment.
+>
+> **Note:** The standalone agent has a simplified S2S v3 implementation. The Splunk app (`splunk-app/etairos_tee/bin/listener.py`) has the full wire-accurate parser with ~99.7% parse rate. If you need maximum fidelity, use the Splunk app or port its parser to standalone.
 
 ### When standalone makes sense
 

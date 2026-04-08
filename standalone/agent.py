@@ -28,9 +28,9 @@ import sys
 import time
 from datetime import datetime, timezone
 
-# Alternate Stream plugin (optional — only active when output.alternate_stream.enabled: true)
+# AlternateStream plugin (optional — only active when output.alternate_stream.enabled: true)
 try:
-    from alternate_stream_writer import Alternate StreamWriter, Alternate StreamConfig
+    from alternate_stream_writer import AlternateStreamWriter, AlternateStreamConfig
     _ALTERNATE_STREAM_AVAILABLE = True
 except ImportError:
     _ALTERNATE_STREAM_AVAILABLE = False
@@ -87,8 +87,27 @@ logging.basicConfig(
 )
 log = logging.getLogger("etairos-log-agent")
 
+# S2S v3 Protocol Constants (wire-captured April 2026)
+# See docs/S2S-PROTOCOL-V3.md for full protocol documentation
+S2S_V3_SIGNATURE = b"--splunk-cooked-mode-v3--"
+S2S_HELLO_LEN = 400  # Fixed struct: _signature[128] + _serverName[256] + _mgmtPort[16]
+S2S_CAPS_TERMINATOR = bytes.fromhex("000000055f72617700")  # \x00\x00\x00\x05_raw\x00
+
+# IX response to send back to UF after caps frame (163 bytes, captured from Splunk 9.1)
+S2S_IX_RESPONSE = bytes.fromhex(
+    "0000009f00000001000000125f5f7332735f636f6e74726f6c5f6d7367"
+    "00000000746361705f726573706f6e73653d737563636573733b"
+    "6361705f666c7573685f6b65793d747275653b"
+    "6964785f63616e5f73656e645f68623d747275653b"
+    "6964785f63616e5f726563765f746f6b656e3d747275653b"
+    "76343d747275653b6368616e6e656c5f6c696d69743d3330303b"
+    "706c3d360000000000000000055f72617700"
+)
+
+# Legacy S2S v2 (still checked for backwards compat)
 S2S_SIGNATURE = b"--CH"
 S2S_SIGNATURE_LEN = 128
+
 shutdown_event = threading.Event()
 
 
@@ -164,7 +183,7 @@ class Config:
         self.log_level    = lg.get("level",        "INFO")
         self.log_every_n  = lg.get("log_every_n",  500)
 
-        # Alternate Stream
+        # AlternateStream
         self.alternate_stream_raw = deep_get(raw, "output", "alternate_stream") or {}
 
         # ACK
@@ -349,14 +368,44 @@ class Forwarder:
 # ---------------------------------------------------------------------------
 
 def handle_client(conn, addr, cfg: Config, lock, forwarder, alternate_stream=None, ack_cfg=None):
+    """
+    Handle a single UF connection using S2S v3 protocol.
+    
+    NOTE: This standalone agent has a simplified S2S v3 implementation.
+    For production use, see splunk-app/etairos_tee/bin/listener.py which
+    has the full wire-accurate parser with ~99.7% parse rate.
+    
+    S2S v3 handshake:
+    1. UF sends 400-byte hello (signature + hostname + mgmt port)
+    2. UF sends variable-length caps frame (ends with CAPS_TERMINATOR)
+    3. We send 163-byte IX response
+    4. UF streams channel-multiplexed event data
+    """
     log.info(f"UF connected: {addr[0]}:{addr[1]}")
     events_written = 0
     try:
-        header = read_exactly(conn, S2S_SIGNATURE_LEN)
-        if not header.startswith(S2S_SIGNATURE):
-            log.warning(f"{addr}: Bad S2S signature {header[:4]!r} — dropping")
-            return
-        log.info(f"{addr}: S2S handshake OK")
+        # Read 400-byte S2S v3 hello
+        hello = read_exactly(conn, S2S_HELLO_LEN)
+        if not hello[:len(S2S_V3_SIGNATURE)].rstrip(b'\x00').startswith(S2S_V3_SIGNATURE[:8]):
+            # Try legacy S2S v2
+            if not hello[:4] == S2S_SIGNATURE:
+                log.warning(f"{addr}: Bad S2S signature {hello[:30]!r} — dropping")
+                return
+            log.info(f"{addr}: S2S v2 handshake (legacy)")
+        else:
+            log.info(f"{addr}: S2S v3 handshake from {hello[128:384].rstrip(b'\\x00').decode('utf-8', errors='replace')}")
+            
+            # Read caps frame until terminator
+            caps_buf = b""
+            while len(caps_buf) < 256:
+                caps_buf += read_exactly(conn, 1)
+                if caps_buf.endswith(S2S_CAPS_TERMINATOR):
+                    break
+            log.debug(f"{addr}: Caps frame consumed: {len(caps_buf)} bytes")
+            
+            # Send IX response
+            conn.sendall(S2S_IX_RESPONSE)
+            log.debug(f"{addr}: Sent IX response ({len(S2S_IX_RESPONSE)} bytes)")
 
         # Set up ACK handler for this connection
         ack: AckHandler = ack_cfg.make_handler(conn) if ack_cfg else None
@@ -399,7 +448,7 @@ def handle_client(conn, addr, cfg: Config, lock, forwarder, alternate_stream=Non
                 with open(cfg.output, "a", encoding="utf-8") as f:
                     f.write(line)
 
-            # Alternate Stream output (OCSF)
+            # AlternateStream output (OCSF)
             if alternate_stream:
                 alternate_stream.write(fields)
 
@@ -463,14 +512,14 @@ def run_server(cfg: Config):
     os.makedirs(os.path.dirname(os.path.abspath(cfg.output)), exist_ok=True)
     lock = threading.Lock()
 
-    # Alternate Stream writer
+    # AlternateStream writer
     alternate_stream = None
     if _ALTERNATE_STREAM_AVAILABLE and cfg.alternate_stream_raw.get("enabled"):
-        lh_cfg   = Alternate StreamConfig(cfg.alternate_stream_raw)
+        lh_cfg   = AlternateStreamConfig(cfg.alternate_stream_raw)
         lh_cfg.validate()
-        alternate_stream = Alternate StreamWriter(lh_cfg, shutdown_event)
+        alternate_stream = AlternateStreamWriter(lh_cfg, shutdown_event)
     elif cfg.alternate_stream_raw.get("enabled"):
-        log.warning("Alternate Stream enabled in config but alternate_stream_writer.py not found — skipping")
+        log.warning("AlternateStream enabled in config but alternate_stream_writer.py not found — skipping")
 
     # ACK config
     ack_cfg = AckConfig(cfg.ack_raw) if cfg.ack_raw else AckConfig({})
