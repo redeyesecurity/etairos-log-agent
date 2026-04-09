@@ -5,9 +5,9 @@
 Runs inside the UF as a scripted input. Intercepts the S2S data stream, converts events to OCSF format, and writes to one or more alternate destinations — while forwarding the original stream to your indexer unchanged.
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                  SPLUNK UNIVERSAL FORWARDER                      │
-│                                                                  │
+┌─────────────────────────────────────────────────────────────────┐
+│                  SPLUNK UNIVERSAL FORWARDER                     │
+│                                                                 │
 │  ┌────────────────┐     ┌──────────────────────────────────┐    │
 │  │  Your existing │     │  etairos_tee (this app)          │    │
 │  │  inputs.conf   │     │                                  │    │
