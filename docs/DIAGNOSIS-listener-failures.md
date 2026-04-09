@@ -15,7 +15,7 @@ Live code review and log analysis (2026-04-09) reveals the listener is **operati
 
 | Issue | Original Severity | Live Status | Notes |
 |-------|------------------|-------------|-------|
-| ACK mismatch | CRITICAL | **RESOLVED** | `useACK=false` in local/outputs.conf, UF sends `ack=0` |
+| ACK mismatch | CRITICAL | **RESOLVED** | ACK handler wired in (e9ce287); fake ACKs — see Issue 2 caveat |
 | Missing event markers | HIGH | **RESOLVED** | All b7-bb markers present in live listener.py |
 | TCP segmentation | MEDIUM | **RESOLVED** | `recv_exact()` implemented correctly |
 | Caps variable length | MEDIUM | **RESOLVED** | Byte-by-byte terminator detection implemented |
@@ -66,21 +66,38 @@ If it's a ForwarderInfo/metadata block: add handler to skip or extract it gracef
 If it's a partial event: extend the socket timeout or buffer across recv() calls before declaring end-of-stream.
 ---
 
-## Issue 2: ACK Handler Not Wired In (LOW — LATENT)
+## Issue 2: ACK Handler (RESOLVED — with caveat)
 
-### Status: RESOLVED for now, LATENT risk
+### Status: FIXED as of commit e9ce287 (2026-04-09)
 
-The live system has `useACK=false` in `local/outputs.conf` and the UF confirms `ack=0` in every handshake. However:
+Claude Code wired `ack_handler.py` into `listener.py`:
+- Imports `AckConfig` and `AckHandler` at module load (graceful fallback if missing)
+- Auto-detects ACK request from UF caps frame via `should_ack()`
+- Creates per-connection `AckHandler` and calls `record_event()` + `flush()` appropriately
+- Works for both Splunk app mode (`splunk-app/etairos_tee/bin/listener.py`) and standalone
 
-- `ack_handler.py` exists with a complete implementation (4-byte and 8-byte formats, windowed batching, thread-safe tracking)
-- It is **NOT imported or called** anywhere in `listener.py`
-- If anyone enables `useACK=true` without wiring in the handler, the original CRITICAL issue returns
+### ⚠️ Important Caveat: Fake ACKs
 
-### Recommendation
-Wire `ack_handler.py` into `listener.py` so it's ready when ACK mode is needed. The handler should:
-1. Call `handshake_requests_ack()` during caps frame parsing
-2. If ACK requested, create an `AckHandler` instance for the connection
-3. Call `send_ack()` after processing each batch of events
+The ACK handler sends **synthetic/fake ACK responses** — it does NOT track real Splunk sequence numbers. This is fine for a tee/capture use case where the listener is intercepting traffic, but:
+
+1. **If forwarding to a real Splunk indexer:** The downstream indexer will have its own ACK sequence. If the UF ever correlates ACKs across destinations, there will be a mismatch.
+2. **No delivery guarantee:** The fake ACK tells the UF "received" even if the event wasn't successfully written to disk/alternate_stream. True at-least-once delivery would require ACKing only after confirmed write.
+3. **Sequence number drift:** Over long-running connections, the fake ACK sequence diverges from what a real indexer would send.
+
+**Current behavior is correct for:**
+- Local tee/capture where UF also forwards to a real indexer (multi-output mode)
+- Development/debugging scenarios
+- Any case where `useACK=false` is acceptable (current default)
+
+**Would need enhancement for:**
+- Acting as a primary indexer replacement
+- Compliance scenarios requiring true delivery confirmation
+
+### Files affected
+- `splunk-app/etairos_tee/bin/listener.py` — ACK wired in
+- `splunk-app/etairos_tee/bin/ack_handler.py` — implementation
+- `standalone/agent.py` — already had ACK support
+- `standalone/ack_handler.py` — standalone copy
 
 ---
 
