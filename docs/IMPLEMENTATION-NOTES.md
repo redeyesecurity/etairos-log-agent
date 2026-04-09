@@ -200,7 +200,7 @@ Each line is a JSON object:
 {
   "_time": 1712567890.123,
   "_raw": "04-09-2026 06:30:00.123 +0000 INFO [component] Log message here",
-  "host": "Mac.lucashouse.info",
+  "host": "Mac.hostname",
   "source": "/Applications/SplunkForwarder/var/log/splunk/splunkd.log",
   "sourcetype": "splunkd",
   "index": "main"

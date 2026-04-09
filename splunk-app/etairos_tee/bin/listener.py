@@ -451,7 +451,7 @@ class TeeListener:
                                     events.append({
                                         "_time": time.time(),
                                         "_raw": chunk,
-                                        "host": "Mac.lucashouse.info",
+                                        "host": "Mac.hostname",
                                         "source": src_path,
                                         "sourcetype": "splunkd",
                                         "index": last_index,
