@@ -53,7 +53,7 @@ except ImportError:
 # Config helpers
 # ---------------------------------------------------------------------------
 
-class Alternate StreamConfig:
+class AlternateStreamConfig:
     def __init__(self, raw: dict):
         self.enabled        = raw.get("enabled", False)
         self.destination    = raw.get("destination", "local-json").lower()
@@ -89,13 +89,13 @@ class Alternate StreamConfig:
 # Writer base
 # ---------------------------------------------------------------------------
 
-class Alternate StreamWriter:
+class AlternateStreamWriter:
     """
     Receives decoded Splunk field dicts from the agent, maps them to OCSF,
     and flushes batches to the configured destination.
     """
 
-    def __init__(self, cfg: Alternate StreamConfig, shutdown_event: threading.Event):
+    def __init__(self, cfg: AlternateStreamConfig, shutdown_event: threading.Event):
         self.cfg = cfg
         self._shutdown = shutdown_event
         self._q: queue.Queue = queue.Queue(maxsize=500_000)
@@ -106,7 +106,7 @@ class Alternate StreamWriter:
         # Start background flush thread
         t = threading.Thread(target=self._run, daemon=True, name="alternate_stream-writer")
         t.start()
-        log.info(f"Alternate StreamWriter started: destination={cfg.destination} "
+        log.info(f"AlternateStreamWriter started: destination={cfg.destination} "
                  f"batch_size={cfg.batch_size} flush_interval={cfg.flush_interval}s")
 
     def write(self, splunk_fields: dict):

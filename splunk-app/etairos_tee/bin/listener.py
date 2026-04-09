@@ -17,6 +17,13 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
+# ACK handler — sends fake ACK responses when UF has useACK=true
+try:
+    from ack_handler import AckConfig, AckHandler
+    HAS_ACK = True
+except ImportError:
+    HAS_ACK = False
+
 # Optional imports for alternate_stream
 try:
     import pyarrow as pa
@@ -62,6 +69,14 @@ class TeeListener:
         except ImportError:
             self.logger.warning("ocsf_mapper not found, OCSF mapping disabled")
             self.mapper = None
+
+        # ACK configuration
+        if HAS_ACK:
+            ack_raw = config.get("ack", {})
+            self.ack_config = AckConfig(ack_raw)
+            self.logger.info(f"ACK config: mode={self.ack_config.mode_str} ack_mode={self.ack_config.ack_mode} window={self.ack_config.window}")
+        else:
+            self.ack_config = None
     
     def start(self):
         """Start the listener and all worker threads"""
@@ -191,6 +206,15 @@ class TeeListener:
             client_socket.sendall(ix_resp)
             self.logger.info(f"Sent S2S v3 control_msg response to {addr}")
 
+            # Set up ACK handler for this connection
+            ack = None
+            if self.ack_config and HAS_ACK:
+                if self.ack_config.should_ack(caps_buf):
+                    ack = self.ack_config.make_handler(client_socket)
+                    self.logger.info(f"ACK enabled for {addr} (mode={self.ack_config.ack_mode}, window={self.ack_config.window})")
+                else:
+                    self.logger.debug(f"ACK not requested by UF {addr}")
+
             # ----------------------------------------------------------------
             # S2S v3 Data Phase: raw stream capture
             # S2S v3 uses channel-multiplexed frames with variable structure.
@@ -219,8 +243,14 @@ class TeeListener:
                     for event in events:
                         self.stats["events_received"] += 1
                         self.event_queue.put(event)
+                        # Send fake ACK if UF requested it
+                        if ack:
+                            ack.record_event()
             except socket.timeout:
                 pass
+            # Flush any pending ACKs before closing
+            if ack:
+                ack.flush()
             self.logger.info(f"Connection done: {addr} total_bytes={total_bytes} remaining_buf={len(raw_buf)}")
         except Exception as e:
             self.logger.exception(f"Connection handler error: {e}")
