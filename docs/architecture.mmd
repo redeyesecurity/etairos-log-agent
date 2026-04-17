@@ -1,0 +1,45 @@
+graph TB
+    subgraph UF["Splunk Universal Forwarder"]
+        Inputs["inputs.conf<br/>(existing data collection)"]
+        Outputs["outputs.conf<br/>points to localhost:19997"]
+        subgraph Tee["etairos_tee App"]
+            Listener["listener.py<br/>S2S v3 listener<br/>:19997"]
+            OCSFMap["ocsf_mapper.py<br/>OCSF v1.1 conversion"]
+            ASW["alternate_stream_writer.py<br/>Multi-destination writer"]
+            ACK["ack_handler.py<br/>Fake S2S ACK"]
+        end
+    end
+
+    Inputs --> Outputs
+    Outputs -->|S2S stream| Listener
+    Listener --> OCSFMap
+    Listener -->|forward original| Indexer
+    OCSFMap --> ASW
+    ACK -.->|ACK responses| Listener
+
+    subgraph Destinations["Alternate Destinations (11 supported)"]
+        S3["S3 / MinIO / R2"]
+        Kafka["Kafka"]
+        Loki["Loki"]
+        ES["Elasticsearch"]
+        LocalFiles["Local JSON / Parquet"]
+        Other["Webhook / Syslog<br/>Azure EH / GCP PubSub<br/>Splunk HEC"]
+    end
+
+    Indexer["Splunk Indexer<br/>(unchanged)"]
+    ASW --> S3
+    ASW --> Kafka
+    ASW --> Loki
+    ASW --> ES
+    ASW --> LocalFiles
+    ASW --> Other
+
+    classDef uf fill:#65a637,color:#fff,stroke:#4a7a28
+    classDef tee fill:#2563eb,color:#fff,stroke:#1d4ed8
+    classDef dest fill:#059669,color:#fff,stroke:#047857
+    classDef indexer fill:#f59e0b,color:#000,stroke:#d97706
+
+    class Inputs,Outputs uf
+    class Listener,OCSFMap,ASW,ACK tee
+    class S3,Kafka,Loki,ES,LocalFiles,Other dest
+    class Indexer indexer
